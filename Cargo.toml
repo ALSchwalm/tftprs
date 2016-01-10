@@ -1,0 +1,18 @@
+[package]
+name = "tftprs"
+version = "0.1.0"
+authors = ["Adam Schwalm <adamschwalm@gmail.com>"]
+
+[dependencies]
+
+[[bin]]
+name = "tftpc"
+path = "src/bin/tftpc.rs"
+
+[[bin]]
+name = "tftpd"
+path = "src/bin/tftpd.rs"
+
+[lib]
+name = "tftp"
+path = "src/lib/lib.rs"
