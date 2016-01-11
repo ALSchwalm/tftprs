@@ -1,16 +1,18 @@
-use std::net::{UdpSocket, ToSocketAddrs, SocketAddr};
+use std::net::{UdpSocket, SocketAddr};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::thread;
 use std::str;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, ErrorKind};
 
+#[derive(Debug)]
 enum TransferMode {
     NetAscii,
     Octet, // 'email' is unsupported
 }
 
+#[derive(Debug)]
 enum Opcode {
     ReadRequest,
     WriteRequest,
@@ -19,6 +21,7 @@ enum Opcode {
     Error,
 }
 
+#[derive(Debug)]
 enum ErrorCode {
     Undefined = 0,
     FileNotFound,
@@ -60,6 +63,7 @@ impl TftpData {
     }
 }
 
+#[derive(Debug)]
 struct TftpError {
     code: ErrorCode,
     message: Option<&'static str>,
@@ -110,7 +114,10 @@ pub struct TftpServer {
 
 impl TftpServer {
     pub fn new<S: AsRef<OsStr> + ?Sized>(root: &S) -> TftpServer {
-        let socket = UdpSocket::bind("0.0.0.0:69").unwrap();
+        let socket = match UdpSocket::bind("0.0.0.0:69") {
+            Ok(s) => s,
+            Err(e) => panic!("bind:{}", e.to_string())
+        };
         TftpServer {
             socket: socket,
             root: PathBuf::from(root),
@@ -143,41 +150,108 @@ impl TftpServer {
         thread::spawn(move || {
             let mut inner_packet = packet;
 
-            let socket = match UdpSocket::bind("0.0.0.0:0") {
-                Ok(s) => s,
-                Err(_) => panic!("Unable to bind to port")
-            };
+            let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
 
             let packet = &mut inner_packet[2..length];
             let mut parts = packet.splitn_mut(3, |x| *x == 0);
 
             let filename = str::from_utf8(parts.next().unwrap()).unwrap();
-            let _ = str::from_utf8(parts.next().unwrap()).unwrap();
+            let mode_str = str::from_utf8(parts.next().unwrap()).unwrap();
 
+            let mode = match &mode_str.to_lowercase()[..] {
+                "netascii" => TransferMode::NetAscii,
+                "octet" => TransferMode::Octet,
+                "email" => panic!("Email mode is unsupported"),
+                _ => panic!("Unknown read mode")
+            };
             let full_path = root.join(filename);
-            if !full_path.exists() {
-                let error_packet = TftpError{
-                    code: ErrorCode::FileNotFound,
-                    message: None
-                }.as_packet();
 
-                socket.send_to(&error_packet, addr);
-                return;
-            }
+            match Self::send_file(&socket, &full_path, &mode, addr) {
+                Ok(_) => (),
 
-            let mut data_packet = TftpData::new();
-            let mut file = File::open(full_path).unwrap();
-            for i in 1.. {
-                data_packet.number = i;
-                let bytes = file.read(&mut data_packet.data).unwrap();
-                if bytes == 0 {
-                    return;
-                } else {
-                    data_packet.used = bytes;
-                    socket.send_to(&data_packet.as_packet(), addr);
-                }
+                // Sending the error is a courtesy, so if it fails, don't
+                // worry about it
+                Err(err) => {socket.send_to(&err.as_packet(), addr).unwrap();}
             }
         });
+    }
+
+    fn translate_io_error(e: ErrorKind) -> TftpError {
+        return match e {
+            ErrorKind::PermissionDenied => TftpError{
+                code: ErrorCode::AccessViolation,
+                message: None
+            },
+            ErrorKind::AlreadyExists => TftpError{
+                code: ErrorCode::FileExists,
+                message: None
+            },
+            _ => panic!("Unexpected io error:{:?}", e)
+        }
+    }
+
+    fn send_file(socket: &UdpSocket, path: &PathBuf,
+                 mode: &TransferMode, addr: SocketAddr) -> Result<(), TftpError> {
+        if !path.exists() {
+            return Err(TftpError{
+                code: ErrorCode::FileNotFound,
+                message: None
+            });
+        }
+
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => return Err(Self::translate_io_error(e.kind()))
+        };
+
+        let mut data_packet = TftpData::new();
+
+        // We just need a 4 byte buffer for the ACK
+        //FIXME: this allows larger messages that happen to start
+        //       with the right bytes to be accepted
+        let mut resp_buffer = [0u8; 4];
+
+        for i in 1.. {
+            data_packet.number = i;
+            let bytes = match file.read(&mut data_packet.data) {
+                Ok(b) => b,
+                Err(e) => return Err(Self::translate_io_error(e.kind()))
+            };
+
+            // A 0 byte file should still get a response, so make sure
+            // that we've sent one. Otherwise, we're done
+            if bytes == 0 && i > 1 {
+                return Ok(());
+            } else {
+                data_packet.used = bytes;
+
+                // Loop until we receive an ACK from the appropriate source
+                loop {
+                    socket.send_to(&data_packet.as_packet(), addr);
+                    let (count, resp_addr) = socket.recv_from(&mut resp_buffer).unwrap();
+
+                    let expected = [
+                        0u8,
+                        4u8,
+                        (data_packet.number >> 8) as u8,
+                        data_packet.number as u8
+                    ];
+
+                    // Receiving a packet from unexpected source does not
+                    // interrupt the operation with the current client
+                    if resp_addr != addr {
+                        socket.send_to(&TftpError{
+                            code: ErrorCode::UnknownTransferID,
+                            message: None
+                        }.as_packet(), resp_addr);
+                    } else if count == 4 && resp_buffer == expected {
+                        // The fragment has been send and acknowledged
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn get_packet_opcode(&self, length: usize, packet: &[u8; 1024]) -> Result<Opcode, TftpError> {
