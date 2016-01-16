@@ -6,165 +6,16 @@ use std::str;
 use std::fs::File;
 use std::io::{Read, ErrorKind, Write};
 
-#[derive(Debug)]
-enum TransferMode {
-    NetAscii,
-    Octet,
-    // 'email' is unsupported
-}
-
-#[derive(Debug)]
-enum Opcode {
-    ReadRequest,
-    WriteRequest,
-    Data,
-    Acknowledgment,
-    Error,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ErrorCode {
-    Undefined = 0,
-    FileNotFound,
-    AccessViolation,
-    DiskFull,
-    IllegalOperation,
-    UnknownTransferID,
-    FileExists,
-    NoSuchUser,
-
-    // Internal error codes
-    SilentError,
-}
-
-trait Packet: Sized {
-    fn as_packet(&self) -> Vec<u8>;
-    fn from_buffer(&[u8]) -> Option<Self>;
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TftpData {
-    number: u16,
-    data: Vec<u8>,
-}
-
-impl TftpData {
-    fn new() -> TftpData {
-        TftpData {
-            number : 0,
-            data : vec![0u8; 512],
-        }
-    }
-}
-
-impl Packet for TftpData {
-    fn as_packet(&self) -> Vec<u8> {
-        let high = (self.number >> 8) as u8;
-        let low = self.number as u8;
-
-        let mut packet = vec![0u8, 3u8, high, low];
-        packet.extend(self.data.iter());
-        packet
-    }
-
-    fn from_buffer(buf: &[u8]) -> Option<TftpData> {
-        if buf.len() < 4 {
-            return None
-        } else if buf[0] != 0u8 || buf[1] != 3u8 {
-            return None
-        }
-        Some(TftpData {
-            number: ((buf[2] as u16) << 8) | buf[3] as u16,
-            data: buf.to_vec()
-        })
-    }
-}
-
-#[test]
-fn tftp_data_round_trip() {
-    let data = TftpData::new();
-    assert!(data == TftpData::from_buffer(&data.as_packet()).unwrap());
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TftpAck {
-    number: u16
-}
-
-impl Packet for TftpAck {
-    fn as_packet(&self) -> Vec<u8> {
-        vec![
-            0x00,
-            0x04,
-            (self.number >> 8) as u8,
-            self.number as u8
-        ]
-    }
-
-    fn from_buffer(buf: &[u8]) -> Option<TftpAck> {
-        if buf.len() != 4 {
-            return None
-        } else if buf[0] != 0u8 || buf[1] != 4u8 {
-            return None
-        }
-        Some(TftpAck{
-            number: ((buf[2] as u16 ) << 8) | buf[3] as u16
-        })
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TftpError {
-    code: ErrorCode,
-    message: Option<&'static str>,
-}
-
-impl Packet for TftpError {
-    fn as_packet(&self) -> Vec<u8> {
-        // The Error Opcode, always 5
-        let mut packet = vec![0u8, 5u8];
-
-        let (code, message) = match self.code {
-            ErrorCode::Undefined =>
-                (0u8, self.message.unwrap_or("Undefined")),
-            ErrorCode::FileNotFound =>
-                (1u8, self.message.unwrap_or("File not found")),
-            ErrorCode::AccessViolation =>
-                (2u8, self.message.unwrap_or("Access violation")),
-            ErrorCode::DiskFull =>
-                (3u8, self.message.unwrap_or("Disk full")),
-            ErrorCode::IllegalOperation =>
-                (4u8, self.message.unwrap_or("Illegal operation")),
-            ErrorCode::UnknownTransferID =>
-                (5u8, self.message.unwrap_or("Unknown transfer id")),
-            ErrorCode::FileExists =>
-                (6u8, self.message.unwrap_or("File exists")),
-            ErrorCode::NoSuchUser =>
-                (7u8, self.message.unwrap_or("No such user")),
-            _ => panic!("The given ErrorCode should not be sent in a packet")
-        };
-
-        // The specific error code
-        packet.push(0u8);
-        packet.push(code);
-
-        // Message and NULL terminator
-        packet.extend(message.bytes());
-        packet.push(0u8);
-
-        packet
-    }
-
-    fn from_buffer(buf: &[u8]) -> Option<TftpError> {
-        None
-    }
-}
+use packet::{Packet};
+use packet::data::TftpData;
+use packet::ack::TftpAck;
+use packet::error::TftpError;
+use codes::{ErrorCode, TransferMode, Opcode};
 
 pub struct TftpServer {
     socket: UdpSocket,
     root: PathBuf,
 }
-
 
 impl TftpServer {
     pub fn new<S: AsRef<OsStr> + ?Sized>(root: &S) -> TftpServer {
@@ -375,7 +226,7 @@ impl TftpServer {
                             message: None
                         }.as_packet(), resp_addr);
                     } else if count == 4 && resp_buffer == expected {
-                        // The fragment has been send and acknowledged
+                        // The fragment has been sent and acknowledged
                         break;
                     }
                 }

@@ -6,10 +6,6 @@ authors = ["Adam Schwalm <adamschwalm@gmail.com>"]
 [dependencies]
 
 [[bin]]
-name = "tftpc"
-path = "src/bin/tftpc.rs"
-
-[[bin]]
 name = "tftpd"
 path = "src/bin/tftpd.rs"
 
