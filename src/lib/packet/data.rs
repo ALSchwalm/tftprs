@@ -6,15 +6,6 @@ pub struct TftpData {
     pub data: Vec<u8>,
 }
 
-impl TftpData {
-    pub fn new() -> TftpData {
-        TftpData {
-            number : 0,
-            data : vec![0u8; 512 - 2 - 2],
-        }
-    }
-}
-
 impl Packet for TftpData {
     fn as_packet(&self) -> Vec<u8> {
         let high = (self.number >> 8) as u8;
@@ -40,7 +31,10 @@ impl Packet for TftpData {
 
 #[test]
 fn tftp_data_round_trip() {
-    let data = TftpData::new();
+    let data = TftpData{
+        number: 1u16,
+        data: vec![0u8; 512]
+    };
     let roundtrip = TftpData::from_buffer(&data.as_packet()).unwrap();
 
     assert_eq!(data, roundtrip);

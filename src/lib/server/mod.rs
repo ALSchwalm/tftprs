@@ -6,7 +6,7 @@ use std::str;
 use std::fs::File;
 use std::io::{Read, ErrorKind, Write};
 
-use packet::{Packet};
+use packet::Packet;
 use packet::data::TftpData;
 use packet::ack::TftpAck;
 use packet::error::TftpError;
@@ -61,7 +61,11 @@ impl TftpServer {
                 code: ErrorCode::FileExists,
                 message: None
             },
-            _ => panic!("Unexpected io error:{:?}", e)
+            ErrorKind::NotFound => TftpError {
+                code: ErrorCode::FileNotFound,
+                message: None
+            },
+            _ => panic!("Unexpected io error: {:?}", e)
         }
     }
 
@@ -74,7 +78,7 @@ impl TftpServer {
             "netascii" => TransferMode::NetAscii,
             "octet" => TransferMode::Octet,
             "email" => panic!("Email mode is unsupported"),
-            _ => panic!("Unknown mode")
+            _ => panic!("Unknown transfer mode")
         };
         (filename, mode)
     }
@@ -107,7 +111,7 @@ impl TftpServer {
             });
         }
 
-        let mut file = match File::open(path) {
+        let mut file = match File::create(path) {
             Ok(f) => f,
             Err(e) => return Err(Self::translate_io_error(e.kind()))
         };
@@ -138,10 +142,19 @@ impl TftpServer {
                 // so ack again
                 if data.number != i+1 {
                     continue;
-                }
+                } else {
 
-                file.write(&data.data);
-                break;
+                    // This is the expected packet, so write it out
+                    file.write(&data.data);
+                    if data.data.len() < 512 {
+                        let ack = TftpAck{number: i+1};
+                        socket.send_to(&ack.as_packet(), addr).unwrap();
+
+                        // No further packets, so stop
+                        return Ok(());
+                    }
+                    break;
+                }
             }
         }
 
@@ -182,41 +195,49 @@ impl TftpServer {
             Err(e) => return Err(Self::translate_io_error(e.kind()))
         };
 
-        let mut data_packet = TftpData::new();
-
         // We just need a 4 byte buffer for the ACK
         //FIXME: this allows larger messages that happen to start
         //       with the right bytes to be accepted
         let mut resp_buffer = [0u8; 4];
-
         let mut previous_bytes_sent = 0;
+
         for i in 1.. {
-            data_packet.number = i;
+            let mut data_packet = TftpData{
+                number: i,
+                data: vec![0u8; 512]
+            };
+
             let file_bytes = match file.read(&mut data_packet.data) {
                 Ok(b) => b,
                 Err(e) => return Err(Self::translate_io_error(e.kind()))
             };
 
+            // If this is the end of the file (we've read less than 512 bytes),
+            // then truncate the data vector so the packet won't be padded with
+            // zeros
+            if file_bytes < 512 {
+                data_packet.data.truncate(file_bytes);
+            }
+
             // A 0 byte file should still get a response, so make sure
             // that we've sent one. Also, if the file length was a multiple
             // of 512, we need to send a 0 size response to show the end.
             // Otherwise, we're done
-            if file_bytes == 0 && i > 1 && previous_bytes_sent < data_packet.data.len() {
+            if file_bytes == 0 && i > 1 && previous_bytes_sent < 512 {
                 return Ok(());
             } else {
                 previous_bytes_sent = file_bytes;
+                let expected_ack = TftpAck{number:i};
 
                 // Loop until we receive an ACK from the appropriate source
                 loop {
-                    socket.send_to(&data_packet.as_packet(), addr);
+                    socket.send_to(&data_packet.as_packet(), addr).unwrap();
                     let (count, resp_addr) = socket.recv_from(&mut resp_buffer).unwrap();
 
-                    let expected = [
-                        0u8,
-                        4u8,
-                        (data_packet.number >> 8) as u8,
-                        data_packet.number as u8
-                    ];
+                    let actual_ack = match TftpAck::from_buffer(&resp_buffer) {
+                        Some(a) => a,
+                        None => continue
+                    };
 
                     // Receiving a packet from unexpected source does not
                     // interrupt the operation with the current client
@@ -225,7 +246,7 @@ impl TftpServer {
                             code: ErrorCode::UnknownTransferID,
                             message: None
                         }.as_packet(), resp_addr);
-                    } else if count == 4 && resp_buffer == expected {
+                    } else if expected_ack == actual_ack {
                         // The fragment has been sent and acknowledged
                         break;
                     }
