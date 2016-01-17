@@ -6,6 +6,8 @@ pub struct TftpData {
     pub data: Vec<u8>,
 }
 
+pub const MAX_DATA_SIZE: usize = 512;
+
 impl Packet for TftpData {
     fn as_packet(&self) -> Vec<u8> {
         let high = (self.number >> 8) as u8;
@@ -33,7 +35,7 @@ impl Packet for TftpData {
 fn tftp_data_round_trip() {
     let data = TftpData{
         number: 1u16,
-        data: vec![0u8; 512]
+        data: vec![0u8; MAX_DATA_SIZE]
     };
     let roundtrip = TftpData::from_buffer(&data.as_packet()).unwrap();
 
