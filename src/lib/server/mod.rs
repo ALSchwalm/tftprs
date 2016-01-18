@@ -1,10 +1,11 @@
-use std::net::{UdpSocket, SocketAddr};
+use std::net::{UdpSocket, SocketAddr, ToSocketAddrs};
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::thread;
 use std::str;
 use std::fs::File;
-use std::io::{Read, ErrorKind, Write};
+use std::io::{Read, Error, ErrorKind, Write};
+use std::sync::Arc;
 
 use packet::Packet;
 use packet::data::TftpData;
@@ -13,9 +14,29 @@ use packet::ack::TftpAck;
 use packet::error::TftpError;
 use codes::{ErrorCode, TransferMode, Opcode};
 
+pub trait Callback<T: ?Sized>: Sync + Send {
+    fn call(&self, arg: &Path);
+}
+
+impl<F, T: ?Sized> Callback<T> for F where F: Fn(&Path), F: Sync + Send {
+    fn call(&self, arg: &Path) {
+        self(arg)
+    }
+}
+
+#[derive(Clone)]
+struct Config {
+    root: PathBuf,
+
+    file_read_started_callback:    Option<Arc<Callback<Path>>>,
+    file_write_started_callback:   Option<Arc<Callback<Path>>>,
+    file_read_completed_callback:  Option<Arc<Callback<Path>>>,
+    file_write_completed_callback: Option<Arc<Callback<Path>>>,
+}
+
 pub struct TftpServer {
     socket: UdpSocket,
-    root: PathBuf,
+    config: Config
 }
 
 type PacketBuff = [u8; 1024];
@@ -23,24 +44,64 @@ impl TftpServer {
 
     /// Create a TFTP server that serves from the given path. This server
     /// will not respond to requests until `start` is called.
-    pub fn new<S: AsRef<OsStr> + ?Sized>(root: &S) -> TftpServer {
-        let socket = match UdpSocket::bind("0.0.0.0:69") {
+    ///
+    /// # Failures
+    /// Returns `Err` if an error occurs while binding to the given address
+    pub fn new<A: ToSocketAddrs, S: AsRef<OsStr> + ?Sized>(addr: A, root: &S)
+                                                           -> Result<TftpServer, Error> {
+        let socket = match UdpSocket::bind(addr) {
             Ok(s) => s,
-            Err(e) => panic!("bind:{}", e.to_string())
+            Err(e) => return Err(e)
         };
-        TftpServer {
+        Ok(TftpServer {
             socket: socket,
-            root: PathBuf::from(root),
-        }
+            config: Config {
+                root: PathBuf::from(root),
+                file_read_started_callback:    None,
+                file_write_started_callback:   None,
+                file_read_completed_callback:  None,
+                file_write_completed_callback: None
+            }
+        })
     }
 
-    /// Start the server. Requests will be handled in different threads.
+    /// Start the server. Requests will be handled in separate threads.
     pub fn start(&self) -> ! {
         loop {
             let mut packet_buffer = [0u8; 1024];
             let (count, addr) = self.socket.recv_from(&mut packet_buffer).unwrap();
             self.handle_request(addr, packet_buffer, count);
         }
+    }
+
+    /// Set a callback function to be invoked when a request is made to read
+    /// a file. This callback will be passed the `Path` of the requested file.
+    pub fn on_read_started<F: Callback<Path> + 'static>(&mut self, callback: F) -> &mut Self {
+        self.config.file_read_started_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set a callback function to be invoked when a request to read a file
+    /// has been fulfilled. This callback will be passed the `Path` of the
+    /// requested file.
+    pub fn on_read_completed<F: Callback<Path> + 'static>(&mut self, callback: F) -> &mut Self {
+        self.config.file_read_completed_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set a callback function to be invoked when a request is made to read
+    /// a file. This callback will be passed the `Path` of the requested file.
+    pub fn on_write_started<F: Callback<Path> + 'static>(&mut self, callback: F) -> &mut Self {
+        self.config.file_write_started_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set a callback function to be invoked when a request to write a file
+    /// has been fulfilled. This callback will be passed the `Path` of the
+    /// requested file.
+    pub fn on_write_completed<F: Callback<Path> + 'static>(&mut self, callback: F) -> &mut Self {
+        self.config.file_write_completed_callback = Some(Arc::new(callback));
+        self
     }
 
     // Dispatch an incoming request to the appropriate handler. Does nothing
@@ -130,7 +191,7 @@ impl TftpServer {
     }
 
     fn handle_write_request(&self, addr: SocketAddr, packet: PacketBuff, length: usize) {
-        let root = self.root.clone();
+        let config = self.config.clone();
         thread::spawn(move || {
             let mut inner_packet = packet;
             let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -138,18 +199,30 @@ impl TftpServer {
             let (filename, mode) = match Self::parse_rw_request(&mut inner_packet, length) {
                 Ok((f, m)) => (f, m),
                 Err(e) => {
-                    socket.send_to(&e.as_packet(), addr);
-                    return ();
+                    match socket.send_to(&e.as_packet(), addr) {
+                        _ => return ()
+                    }
                 }
             };
 
-            let full_path = root.join(filename);
+            let full_path = config.root.join(filename);
+
+            match config.file_write_started_callback {
+                Some(callback) => callback.call(&full_path),
+                None => ()
+            }
+
             match Self::recieve_file(&socket, &full_path, &mode, addr) {
                 Ok(_) => (),
 
                 // Sending the error is a courtesy, so if it fails, don't
                 // worry about it
                 Err(err) => {socket.send_to(&err.as_packet(), addr).unwrap();}
+            }
+
+            match config.file_write_completed_callback {
+                Some(callback) => callback.call(&full_path),
+                None => ()
             }
         });
     }
@@ -181,7 +254,7 @@ impl TftpServer {
                 // Receiving a packet from unexpected source does not
                 // interrupt the operation with the current client
                 if resp_addr != addr {
-                    socket.send_to(&TftpError{
+                    let _ = socket.send_to(&TftpError{
                         code: ErrorCode::UnknownTransferID,
                         message: None
                     }.as_packet(), resp_addr);
@@ -217,7 +290,7 @@ impl TftpServer {
     }
 
     fn handle_read_request(&self, addr: SocketAddr, packet: PacketBuff, length: usize) {
-        let root = self.root.clone();
+        let config = self.config.clone();
         thread::spawn(move || {
             let mut inner_packet = packet;
             let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -225,19 +298,34 @@ impl TftpServer {
             let (filename, mode) = match Self::parse_rw_request(&mut inner_packet, length) {
                 Ok((f, m)) => (f, m),
                 Err(e) => {
-                    socket.send_to(&e.as_packet(), addr);
-                    return ();
+                    match socket.send_to(&e.as_packet(), addr) {
+                        _ => return ()
+                    }
                 }
             };
 
-            let full_path = root.join(filename);
+            let full_path = config.root.join(filename);
+
+            match config.file_read_started_callback {
+                Some(callback) => callback.call(&full_path),
+                None => ()
+            }
 
             match Self::send_file(&socket, &full_path, &mode, addr) {
                 Ok(_) => (),
 
                 // Sending the error is a courtesy, so if it fails, don't
                 // worry about it
-                Err(err) => {socket.send_to(&err.as_packet(), addr).unwrap();}
+                Err(err) => {
+                    match socket.send_to(&err.as_packet(), addr) {
+                        _ => return ()
+                    }
+                }
+            }
+
+            match config.file_read_completed_callback {
+                Some(callback) => callback.call(&full_path),
+                None => ()
             }
         });
     }
