@@ -23,8 +23,5 @@ pub enum ErrorCode {
     IllegalOperation,
     UnknownTransferID,
     FileExists,
-    NoSuchUser,
-
-    // Internal error codes
-    SilentError,
+    NoSuchUser
 }

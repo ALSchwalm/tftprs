@@ -1,5 +1,8 @@
+use std::io::ErrorKind;
+
 use packet::Packet;
 use codes::{ErrorCode, Opcode};
+
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct TftpError {
@@ -29,7 +32,6 @@ impl Packet for TftpError {
                 (6u8, self.message.unwrap_or("File exists")),
             ErrorCode::NoSuchUser =>
                 (7u8, self.message.unwrap_or("No such user")),
-            _ => panic!("The given ErrorCode should not be sent in a packet")
         };
 
         // The specific error code
@@ -45,5 +47,29 @@ impl Packet for TftpError {
 
     fn from_buffer(buf: &[u8]) -> Option<TftpError> {
         None
+    }
+}
+
+
+// Translates a standard rust io error into a TftpError to be sent
+// over the wire.
+pub fn translate_io_error(e: ErrorKind) -> TftpError {
+    return match e {
+        ErrorKind::PermissionDenied => TftpError{
+            code: ErrorCode::AccessViolation,
+            message: None
+        },
+        ErrorKind::AlreadyExists => TftpError{
+            code: ErrorCode::FileExists,
+            message: None
+        },
+        ErrorKind::NotFound => TftpError {
+            code: ErrorCode::FileNotFound,
+            message: None
+        },
+        _ => TftpError {
+            code: ErrorCode::Undefined,
+            message: Some("An unknown IO error occurred")
+        }
     }
 }
