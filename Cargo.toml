@@ -4,6 +4,8 @@ version = "0.1.0"
 authors = ["Adam Schwalm <adamschwalm@gmail.com>"]
 
 [dependencies]
+docopt = "0.6"
+rustc-serialize = "0.3"
 
 [[bin]]
 name = "tftpd"
