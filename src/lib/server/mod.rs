@@ -4,48 +4,21 @@ use std::path::{PathBuf, Path};
 use std::thread;
 use std::str;
 use std::fs::File;
-use std::io::{Read, Error, Write};
+use std::io::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
-use packet::{Packet, PacketBuff, get_packet_opcode};
-use packet::data::TftpData;
-use packet::data;
-use packet::ack::TftpAck;
-use packet::error::{TftpError, translate_io_error};
 use codes::{ErrorCode, TransferMode, Opcode};
-
-/// A simple trait representing a callable that will be invoked after some
-/// event has occurred.
-pub trait Callback<T: ?Sized, U: ?Sized>: Sync + Send {
-    fn call(&self, arg1: &T, arg2: &U);
-}
-
-/// A default implementation for Fn
-impl<F, T: ?Sized, U: ?Sized> Callback<T, U> for F where F: Fn(&T, &U), F: Sync + Send {
-    fn call(&self, arg1: &T, arg2: &U) {
-        self(arg1, arg2)
-    }
-}
-
-#[derive(Clone)]
-struct Config {
-    root: PathBuf,
-
-    file_read_started_callback:    Option<Arc<Callback<Path, File>>>,
-    file_write_started_callback:   Option<Arc<Callback<Path, File>>>,
-    file_read_completed_callback:  Option<Arc<Callback<Path, File>>>,
-    file_write_completed_callback: Option<Arc<Callback<Path, File>>>,
-
-    read_timeout: Option<Duration>,
-    send_retry_attempts: u8
-}
+use packet::{Packet, PacketBuff, get_packet_opcode};
+use packet::error::TftpError;
+use transfer::{recieve_file, send_file};
+use config::Config;
+use callback::Callback;
 
 pub struct TftpServer {
     socket: UdpSocket,
     config: Config
 }
-
 
 impl TftpServer {
 
@@ -59,10 +32,7 @@ impl TftpServer {
     /// Returns `Err` if an error occurs while binding to the given address
     pub fn new<A: ToSocketAddrs, S: AsRef<OsStr> + ?Sized>(addr: A, root: &S)
                                                            -> Result<TftpServer, Error> {
-        let socket = match UdpSocket::bind(addr) {
-            Ok(s) => s,
-            Err(e) => return Err(e)
-        };
+        let socket = try!(UdpSocket::bind(addr));
         Ok(TftpServer {
             socket: socket,
             config: Config {
@@ -158,7 +128,7 @@ impl TftpServer {
             Some(filename_buff) => str::from_utf8(filename_buff).unwrap(),
             None => return Err(TftpError{
                 code: ErrorCode::Undefined,
-                message: Some("Invalid filename")
+                message: Some("Invalid filename".to_string())
             })
         };
 
@@ -166,7 +136,7 @@ impl TftpServer {
             Some(mode_str_buff) => str::from_utf8(mode_str_buff).unwrap(),
             None => return Err(TftpError{
                 code: ErrorCode::Undefined,
-                message: Some("Invalid mode string")
+                message: Some("Invalid mode string".to_string())
             })
         };
 
@@ -175,11 +145,11 @@ impl TftpServer {
             "octet" => TransferMode::Octet,
             "email" => return Err(TftpError{
                 code: ErrorCode::Undefined,
-                message: Some("Email transfer mode is not supported")
+                message: Some("Email transfer mode is not supported".to_string())
             }),
             _ => return Err(TftpError{
                 code: ErrorCode::Undefined,
-                message: Some("Unknown transfer mode")
+                message: Some("Unknown transfer mode".to_string())
             }),
         };
         Ok((filename, mode))
@@ -202,13 +172,13 @@ impl TftpServer {
 
             let full_path = config.root.join(filename);
 
-            let file = match Self::recieve_file(&config, &socket, &full_path, &mode, addr) {
+            let file = match recieve_file(&config, &socket, &full_path, &mode, addr) {
                 Ok(f) => f,
 
                 // Sending the error is a courtesy, so if it fails, don't
                 // worry about it
                 Err(err) => {
-                    socket.send_to(&err.as_packet(), addr).unwrap();
+                    let _ = socket.send_to(&err.as_packet(), addr);
                     return ();
                 }
             };
@@ -220,78 +190,6 @@ impl TftpServer {
         });
     }
 
-    fn recieve_file(config: &Config, socket: &UdpSocket, path: &PathBuf,
-                    _: &TransferMode, addr: SocketAddr) -> Result<File, TftpError> {
-        if path.exists() {
-            return Err(TftpError{
-                code: ErrorCode::FileExists,
-                message: None
-            });
-        }
-
-        let mut file = match File::create(path) {
-            Ok(f) => f,
-            Err(e) => return Err(translate_io_error(e.kind()))
-        };
-
-        match config.file_write_started_callback {
-            Some(ref callback) => callback.call(&path, &file),
-            None => ()
-        }
-
-        // The buffer to receive data into. Max size is 512 payload bytes plus
-        // 2 for opcode and 2 for
-        let mut resp_buffer = [0u8; data::MAX_DATA_SIZE + 2 + 2];
-        for number in 0.. {
-            for _ in 0..config.send_retry_attempts {
-                let ack = TftpAck{number: number};
-                socket.send_to(&ack.as_packet(), addr).unwrap();
-
-                let (count, resp_addr) = match socket.recv_from(&mut resp_buffer) {
-                    Ok(r) => r,
-
-                    // Different platforms are allowed to return different
-                    // error codes for timeouts, so just assume any error
-                    // is a timeout and try again
-                    Err(_) => continue
-                };
-
-                // Receiving a packet from unexpected source does not
-                // interrupt the operation with the current client
-                if resp_addr != addr {
-                    let _ = socket.send_to(&TftpError{
-                        code: ErrorCode::UnknownTransferID,
-                        message: None
-                    }.as_packet(), resp_addr);
-                }
-
-                let data =
-                    match TftpData::from_buffer(&resp_buffer[..count]) {
-                        Some(d) => d,
-                        None => continue
-                    };
-
-                // This is an unexpected data packet (probably a retransmission)
-                // so ack again
-                if data.number != number+1 {
-                    continue;
-                } else {
-
-                    // This is the expected packet, so write it out
-                    file.write(&data.data);
-                    if data.data.len() < data::MAX_DATA_SIZE {
-                        let ack = TftpAck{number: number+1};
-                        socket.send_to(&ack.as_packet(), addr).unwrap();
-
-                        // No further packets, so stop
-                        return Ok(file);
-                    }
-                    break;
-                }
-            }
-        }
-        unreachable!();
-    }
 
     fn handle_read_request(&self, addr: SocketAddr, packet: PacketBuff, length: usize) {
         let config = self.config.clone();
@@ -310,7 +208,7 @@ impl TftpServer {
 
             let full_path = config.root.join(filename);
 
-            let file = match Self::send_file(&config, &socket, &full_path, &mode, addr) {
+            let file = match send_file(&config, &socket, &full_path, &mode, addr) {
                 Ok(f) => f,
 
                 // Sending the error is a courtesy, so if it fails, don't
@@ -327,85 +225,5 @@ impl TftpServer {
                 None => ()
             }
         });
-    }
-
-    fn send_file(config: &Config, socket: &UdpSocket, path: &PathBuf,
-                 _: &TransferMode, addr: SocketAddr) -> Result<File, TftpError> {
-        if !path.exists() {
-            return Err(TftpError{
-                code: ErrorCode::FileNotFound,
-                message: None
-            });
-        }
-
-        let mut file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) => return Err(translate_io_error(e.kind()))
-        };
-
-        match config.file_read_started_callback {
-            Some(ref callback) => callback.call(&path, &file),
-            None => ()
-        }
-
-        // We just need a 4 byte buffer for the ACK
-        //FIXME: this allows larger messages that happen to start
-        //       with the right bytes to be accepted
-        let mut resp_buffer = [0u8; 4];
-        let mut previous_bytes_sent = 0;
-
-        for number in 1.. {
-            let mut data_packet = TftpData{
-                number: number,
-                data: vec![0u8; data::MAX_DATA_SIZE]
-            };
-
-            let file_bytes = match file.read(&mut data_packet.data) {
-                Ok(b) => b,
-                Err(e) => return Err(translate_io_error(e.kind()))
-            };
-
-            // If this is the end of the file (we've read less than 512 bytes),
-            // then truncate the data vector so the packet won't be padded with
-            // zeros
-            if file_bytes < data::MAX_DATA_SIZE {
-                data_packet.data.truncate(file_bytes);
-            }
-
-            // A 0 byte file should still get a response, so make sure
-            // that we've sent one. Also, if the file length was a multiple
-            // of 512, we need to send a 0 size response to show the end.
-            // Otherwise, we're done
-            if file_bytes == 0 && number > 1 && previous_bytes_sent < data::MAX_DATA_SIZE {
-                return Ok(file);
-            } else {
-                previous_bytes_sent = file_bytes;
-                let expected_ack = TftpAck{number:number};
-
-                // Loop until we receive an ACK from the appropriate source
-                for _ in 0..config.send_retry_attempts {
-                    socket.send_to(&data_packet.as_packet(), addr).unwrap();
-                    let (count, resp_addr) = socket.recv_from(&mut resp_buffer).unwrap();
-
-                    let actual_ack = match TftpAck::from_buffer(&resp_buffer[..count]) {
-                        Some(a) => a,
-                        None => continue
-                    };
-
-                    // Receiving a packet from unexpected source does not
-                    // interrupt the operation with the current client
-                    if resp_addr != addr {
-                        socket.send_to(&TftpError{
-                            code: ErrorCode::UnknownTransferID,
-                            message: None
-                        }.as_packet(), resp_addr);
-                    } else if expected_ack == actual_ack {
-                        // The fragment has been sent and acknowledged
-                        break;
-                    }
-                }
-            }
-        }
-        unreachable!();
     }
 }

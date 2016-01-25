@@ -19,7 +19,7 @@ pub fn get_packet_opcode(length: usize, packet: &PacketBuff) -> Result<Opcode, T
     if length < 2 || packet[0] != 0 {
         return Err(TftpError {
             code: ErrorCode::Undefined,
-            message: Some("Invalid opcode"),
+            message: Some("Invalid opcode".to_string()),
         });
     }
 
@@ -32,7 +32,7 @@ pub fn get_packet_opcode(length: usize, packet: &PacketBuff) -> Result<Opcode, T
         _ => {
             Err(TftpError {
                 code: ErrorCode::Undefined,
-                message: Some("Invalid opcode"),
+                message: Some("Invalid opcode".to_string()),
             })
         }
     }
