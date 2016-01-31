@@ -27,9 +27,8 @@ pub fn recieve_file(config: &Config, socket: &UdpSocket, path: &PathBuf,
         Err(e) => return Err(translate_io_error(e.kind()))
     };
 
-    match config.file_write_started_callback {
-        Some(ref callback) => callback.call(&path, &file),
-        None => ()
+    if let Some(ref callback) = config.file_write_started_callback {
+        callback.call(&path, &file);
     }
 
     // The buffer to receive data into. Max size is 512 payload bytes plus
@@ -75,12 +74,11 @@ pub fn recieve_file(config: &Config, socket: &UdpSocket, path: &PathBuf,
             } else {
 
                 // This is the expected packet, so write it out
-                match file.write_all(&data.data) {
-                    Err(_) => return Err(TftpError{
+                if let Err(_) = file.write_all(&data.data) {
+                    return Err(TftpError{
                         code: ErrorCode::Undefined,
                         message: None
-                    }),
-                    _ => ()
+                    });
                 }
 
                 if data.data.len() < data::MAX_DATA_SIZE {
@@ -119,9 +117,8 @@ pub fn send_file(config: &Config, socket: &UdpSocket, path: &PathBuf,
         Err(e) => return Err(translate_io_error(e.kind()))
     };
 
-    match config.file_read_started_callback {
-        Some(ref callback) => callback.call(&path, &file),
-        None => ()
+    if let Some(ref callback) = config.file_read_started_callback {
+        callback.call(&path, &file);
     }
 
     // We just need a 4 byte buffer for the ACK

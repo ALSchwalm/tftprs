@@ -106,16 +106,12 @@ impl TftpServer {
     // Dispatch an incoming request to the appropriate handler. Does nothing
     // if the packet is ill-formed or unexpected.
     fn handle_request(&self, addr: SocketAddr, packet: PacketBuff, length: usize) {
-        let code = get_packet_opcode(length, &packet);
-        match code {
-            Ok(code) => {
-                match code {
-                    Opcode::ReadRequest => self.handle_read_request(addr, packet, length),
-                    Opcode::WriteRequest => self.handle_write_request(addr, packet, length),
-                    _ => (),
-                }
+        if let Ok(code) = get_packet_opcode(length, &packet) {
+            match code {
+                Opcode::ReadRequest => self.handle_read_request(addr, packet, length),
+                Opcode::WriteRequest => self.handle_write_request(addr, packet, length),
+                _ => (),
             }
-            Err(_) => (),
         }
     }
 
@@ -164,9 +160,8 @@ impl TftpServer {
             let (filename, mode) = match Self::parse_rw_request(&packet, length) {
                 Ok((f, m)) => (f, m),
                 Err(e) => {
-                    match socket.send_to(&e.as_packet(), addr) {
-                        _ => return ()
-                    }
+                    let _ = socket.send_to(&e.as_packet(), addr);
+                    return ();
                 }
             };
 
@@ -183,9 +178,8 @@ impl TftpServer {
                 }
             };
 
-            match config.file_write_completed_callback {
-                Some(callback) => callback.call(&full_path, &file),
-                None => ()
+            if let Some(callback) = config.file_write_completed_callback {
+                callback.call(&full_path, &file);
             }
         });
     }
@@ -200,9 +194,8 @@ impl TftpServer {
             let (filename, mode) = match Self::parse_rw_request(&packet, length) {
                 Ok((f, m)) => (f, m),
                 Err(e) => {
-                    match socket.send_to(&e.as_packet(), addr) {
-                        _ => return ()
-                    }
+                    let _ = socket.send_to(&e.as_packet(), addr);
+                    return ();
                 }
             };
 
@@ -214,15 +207,13 @@ impl TftpServer {
                 // Sending the error is a courtesy, so if it fails, don't
                 // worry about it
                 Err(err) => {
-                    match socket.send_to(&err.as_packet(), addr) {
-                        _ => return ()
-                    }
+                    let _ = socket.send_to(&err.as_packet(), addr);
+                    return ();
                 }
             };
 
-            match config.file_read_completed_callback {
-                Some(callback) => callback.call(&full_path, &file),
-                None => ()
+            if let Some(callback) = config.file_read_completed_callback {
+                callback.call(&full_path, &file);
             }
         });
     }
